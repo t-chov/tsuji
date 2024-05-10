@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,13 +12,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/fatih/color"
 	"github.com/urfave/cli/v2"
 )
 
 const (
-	OREGON     = "us-west-2"
-	errorColor = color.FgRed
+	OREGON        = "us-west-2"
+	errorColor    = color.FgRed
+	SYSTEM_PROMPT = "As a teacher specialized in English learning, please respond in a way that improves the English ability of the learners."
 )
 
 func main() {
@@ -65,11 +69,20 @@ func initApp() *cli.App {
 				return nil
 			},
 		},
+		// TODO:
+		// 3. 英語学習用に追い込む
+		// 4. テスト
 		{
-			Name:  "example",
-			Usage: "example output",
+			Name:  "translate",
+			Usage: "translate input",
 			Action: func(ctx *cli.Context) error {
 				cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(OREGON))
+				if err != nil {
+					return err
+				}
+
+				reader := bufio.NewReader(os.Stdin)
+				text, err := reader.ReadString('\n')
 				if err != nil {
 					return err
 				}
@@ -84,17 +97,16 @@ func initApp() *cli.App {
 							Content: []ClaudeMessageContent{
 								{
 									Type: "text",
-									Text: "Hello",
+									Text: "please translate following messages to English\n" + text,
 								},
 							},
 						},
 					},
 				}
 				body, _ := json.Marshal(payload)
-				fmt.Println(string(body))
 
 				brc := bedrockruntime.NewFromConfig(cfg)
-				res, err := brc.InvokeModel(context.TODO(), &bedrockruntime.InvokeModelInput{
+				res, err := brc.InvokeModelWithResponseStream(context.TODO(), &bedrockruntime.InvokeModelWithResponseStreamInput{
 					ModelId:     aws.String("anthropic.claude-3-sonnet-20240229-v1:0"),
 					ContentType: aws.String("application/json"),
 					Body:        body,
@@ -102,7 +114,12 @@ func initApp() *cli.App {
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(res.Body))
+				if _, err := processStreamingOutput(res, func(ctx context.Context, part []byte) error {
+					fmt.Print(string(part))
+					return nil
+				}); err != nil {
+					return err
+				}
 
 				return nil
 			},
@@ -118,6 +135,42 @@ func appRun(c *cli.Context) error {
 		cli.ShowAppHelp(c)
 	}
 	return nil
+}
+
+func processStreamingOutput(
+	output *bedrockruntime.InvokeModelWithResponseStreamOutput,
+	handler streamingOutputHandler,
+) (StreamResponse, error) {
+	var combinedResult string
+	resp := StreamResponse{}
+	for event := range output.GetStream().Events() {
+		switch v := event.(type) {
+		case *types.ResponseStreamMemberChunk:
+			// for debug
+			// fmt.Println("payload", string(v.Value.Bytes))
+			var resp StreamResponse
+			if err := json.NewDecoder(bytes.NewReader(v.Value.Bytes)).Decode(&resp); err != nil {
+				return resp, err
+			}
+			if resp.Delta != nil {
+				handler(context.Background(), []byte(resp.Delta.Text))
+				combinedResult += resp.Delta.Text
+			}
+			if resp.Type == "content_block_stop" {
+				handler(context.Background(), []byte("\n"))
+				combinedResult += "\n"
+			}
+		case *types.UnknownUnionMember:
+			fmt.Println("unknown tag: ", v.Tag)
+		default:
+			fmt.Println("union is nil or unknown type")
+		}
+	}
+	resp.Delta = &StreamResponseDelta{
+		Type: "text_delta",
+		Text: combinedResult,
+	}
+	return resp, nil
 }
 
 type Claude3Request struct {
@@ -138,3 +191,16 @@ type ClaudeMessageContent struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 }
+
+type StreamResponse struct {
+	Type  string               `json:"type"`
+	Index int                  `json:"index,omitempty"`
+	Delta *StreamResponseDelta `json:"delta,omitempty"`
+}
+
+type StreamResponseDelta struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type streamingOutputHandler func(ctx context.Context, part []byte) error
